@@ -1,5 +1,8 @@
 use super::*;
-use hbb_common::{allow_err, platform::linux::DISTRO};
+use hbb_common::{
+    allow_err,
+    platform::linux::{CMD_SH, DISTRO},
+};
 use scrap::{is_cursor_embedded, set_map_err, Capturer, Display, Frame, TraitCapturer};
 use std::io;
 use std::process::{Command, Output};
@@ -21,12 +24,6 @@ pub fn init() {
 }
 
 fn map_err_scrap(err: String) -> io::Error {
-    // to-do: Remove this the following log
-    log::error!(
-        "REMOVE ME ===================================== wayland scrap error {}",
-        &err
-    );
-
     // to-do: Handle error better, do not restart server
     if err.starts_with("Did not receive a reply") {
         log::error!("Fatal pipewire error, {}", &err);
@@ -115,7 +112,7 @@ pub(super) fn is_inited() -> Option<Message> {
 
 fn get_max_desktop_resolution() -> Option<String> {
     // works with Xwayland
-    let output: Output = Command::new("sh")
+    let output: Output = Command::new(CMD_SH.as_str())
         .arg("-c")
         .arg("xrandr | awk '/current/ { print $8,$9,$10 }'")
         .output()
@@ -135,6 +132,7 @@ pub(super) async fn check_init() -> ResultType<()> {
         let mut maxx = 0;
         let mut miny = 0;
         let mut maxy = 0;
+        let use_uinput = crate::input_service::wayland_use_uinput();
 
         if *CAP_DISPLAY_INFO.read().unwrap() == 0 {
             let mut lock = CAP_DISPLAY_INFO.write().unwrap();
@@ -167,28 +165,29 @@ pub(super) async fn check_init() -> ResultType<()> {
                     num_cpus::get(),
                 );
 
-                let (max_width, max_height) = match get_max_desktop_resolution() {
-                    Some(result) if !result.is_empty() => {
-                        let resolution: Vec<&str> = result.split(" ").collect();
-                        let w: i32 = resolution[0].parse().unwrap_or(origin.0 + width as i32);
-                        let h: i32 = resolution[2]
-                            .trim_end_matches(",")
-                            .parse()
-                            .unwrap_or(origin.1 + height as i32);
-                        if w < origin.0 + width as i32 || h < origin.1 + height as i32 {
-                            (origin.0 + width as i32, origin.1 + height as i32)
+                if use_uinput {
+                    let (max_width, max_height) = match get_max_desktop_resolution() {
+                        Some(result) if !result.is_empty() => {
+                            let resolution: Vec<&str> = result.split(" ").collect();
+                            let w: i32 = resolution[0].parse().unwrap_or(origin.0 + width as i32);
+                            let h: i32 = resolution[2]
+                                .trim_end_matches(",")
+                                .parse()
+                                .unwrap_or(origin.1 + height as i32);
+                            if w < origin.0 + width as i32 || h < origin.1 + height as i32 {
+                                (origin.0 + width as i32, origin.1 + height as i32)
+                            } else {
+                                (w, h)
+                            }
                         }
-                        else{
-                            (w, h)
-                        }
-                    }
-                    _ => (origin.0 + width as i32, origin.1 + height as i32),
-                };
+                        _ => (origin.0 + width as i32, origin.1 + height as i32),
+                    };
 
-                minx = 0;
-                maxx = max_width;
-                miny = 0;
-                maxy = max_height;
+                    minx = 0;
+                    maxx = max_width;
+                    miny = 0;
+                    maxy = max_height;
+                }
 
                 let capturer = Box::into_raw(Box::new(
                     Capturer::new(display).with_context(|| "Failed to create capturer")?,
@@ -206,15 +205,17 @@ pub(super) async fn check_init() -> ResultType<()> {
             }
         }
 
-        if minx != maxx && miny != maxy {
-            log::info!(
-                "update mouse resolution: ({}, {}), ({}, {})",
-                minx,
-                maxx,
-                miny,
-                maxy
-            );
-            allow_err!(input_service::update_mouse_resolution(minx, maxx, miny, maxy).await);
+        if use_uinput {
+            if minx != maxx && miny != maxy {
+                log::info!(
+                    "update mouse resolution: ({}, {}), ({}, {})",
+                    minx,
+                    maxx,
+                    miny,
+                    maxy
+                );
+                allow_err!(input_service::update_mouse_resolution(minx, maxx, miny, maxy).await);
+            }
         }
     }
     Ok(())

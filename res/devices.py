@@ -12,6 +12,7 @@ def view(
     device_name=None,
     user_name=None,
     group_name=None,
+    device_group_name=None,
     offline_days=None,
 ):
     headers = {"Authorization": f"Bearer {token}"}
@@ -21,6 +22,7 @@ def view(
         "device_name": device_name,
         "user_name": user_name,
         "group_name": group_name,
+        "device_group_name": device_group_name,
     }
 
     params = {
@@ -46,7 +48,7 @@ def view(
                 devices.append(device)
                 continue
             last_online = datetime.strptime(
-                device["last_online"], "%Y-%m-%dT%H:%M:%S"
+                device["last_online"].split(".")[0], "%Y-%m-%dT%H:%M:%S"
             )  # assuming date is in this format
             if (datetime.utcnow() - last_online).days >= offline_days:
                 devices.append(device)
@@ -91,11 +93,24 @@ def delete(url, token, guid, id):
     return check(response)
 
 
+def assign(url, token, guid, id, type, value):
+    print("assign", id, type, value)
+    if type != "ab" and type != "strategy_name" and type != "user_name":
+        print("Invalid type, it must be 'ab', 'strategy_name' or 'user_name'")
+        return
+    data = {"type": type, "value": value}
+    headers = {"Authorization": f"Bearer {token}"}
+    response = requests.post(
+        f"{url}/api/devices/{guid}/assign", headers=headers, json=data
+    )
+    return check(response)
+
+
 def main():
     parser = argparse.ArgumentParser(description="Device manager")
     parser.add_argument(
         "command",
-        choices=["view", "disable", "enable", "delete"],
+        choices=["view", "disable", "enable", "delete", "assign"],
         help="Command to execute",
     )
     parser.add_argument("--url", required=True, help="URL of the API")
@@ -105,12 +120,19 @@ def main():
     parser.add_argument("--id", help="Device ID")
     parser.add_argument("--device_name", help="Device name")
     parser.add_argument("--user_name", help="User name")
-    parser.add_argument("--group_name", help="Group name")
+    parser.add_argument("--group_name", help="User group name")
+    parser.add_argument("--device_group_name", help="Device group name")
+    parser.add_argument(
+        "--assign_to",
+        help="<type>=<value>, e.g. user_name=mike, strategy_name=test, ab=ab1, ab=ab1,tag1",
+    )
     parser.add_argument(
         "--offline_days", type=int, help="Offline duration in days, e.g., 7"
     )
 
     args = parser.parse_args()
+    
+    while args.url.endswith("/"): args.url = args.url[:-1]
 
     devices = view(
         args.url,
@@ -119,6 +141,7 @@ def main():
         args.device_name,
         args.user_name,
         args.group_name,
+        args.device_group_name,
         args.offline_days,
     )
 
@@ -136,6 +159,16 @@ def main():
     elif args.command == "delete":
         for device in devices:
             response = delete(args.url, args.token, device["guid"], device["id"])
+            print(response)
+    elif args.command == "assign":
+        if "=" not in args.assign_to:
+            print("Invalid assign_to format, it must be <type>=<value>")
+            return
+        type, value = args.assign_to.split("=", 1)
+        for device in devices:
+            response = assign(
+                args.url, args.token, device["guid"], device["id"], type, value
+            )
             print(response)
 
 

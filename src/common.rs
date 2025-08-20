@@ -1,8 +1,43 @@
 use std::{
-    borrow::Cow,
+    collections::HashMap,
     future::Future,
+    net::{SocketAddr, ToSocketAddrs},
     sync::{Arc, Mutex, RwLock},
     task::Poll,
+};
+
+use serde_json::{json, Map, Value};
+
+#[cfg(not(target_os = "ios"))]
+use hbb_common::whoami;
+use hbb_common::{
+    allow_err,
+    anyhow::{anyhow, Context},
+    bail, base64,
+    bytes::Bytes,
+    config::{
+        self, keys, use_ws, Config, LocalConfig, CONNECT_TIMEOUT, READ_TIMEOUT, RENDEZVOUS_PORT,
+    },
+    futures::future::join_all,
+    futures_util::future::poll_fn,
+    get_version_number, log,
+    message_proto::*,
+    protobuf::{Enum, Message as _},
+    rendezvous_proto::*,
+    socket_client,
+    sodiumoxide::crypto::{box_, secretbox, sign},
+    timeout,
+    tokio::{
+        self,
+        net::UdpSocket,
+        time::{Duration, Instant, Interval},
+    },
+    ResultType, Stream,
+};
+
+use crate::{
+    hbbs_http::create_http_client_async,
+    ui_interface::{get_option, set_option},
 };
 
 #[derive(Debug, Eq, PartialEq)]
@@ -13,151 +48,7 @@ pub enum GrabState {
     Exit,
 }
 
-#[cfg(all(target_os = "linux", feature = "unix-file-copy-paste"))]
-static X11_CLIPBOARD: once_cell::sync::OnceCell<x11_clipboard::Clipboard> =
-    once_cell::sync::OnceCell::new();
-
-#[cfg(all(target_os = "linux", feature = "unix-file-copy-paste"))]
-fn get_clipboard() -> Result<&'static x11_clipboard::Clipboard, String> {
-    X11_CLIPBOARD
-        .get_or_try_init(|| x11_clipboard::Clipboard::new())
-        .map_err(|e| e.to_string())
-}
-
-#[cfg(all(target_os = "linux", feature = "unix-file-copy-paste"))]
-pub struct ClipboardContext {
-    string_setter: x11rb::protocol::xproto::Atom,
-    string_getter: x11rb::protocol::xproto::Atom,
-    text_uri_list: x11rb::protocol::xproto::Atom,
-
-    clip: x11rb::protocol::xproto::Atom,
-    prop: x11rb::protocol::xproto::Atom,
-}
-
-#[cfg(all(target_os = "linux", feature = "unix-file-copy-paste"))]
-fn parse_plain_uri_list(v: Vec<u8>) -> Result<String, String> {
-    let text = String::from_utf8(v).map_err(|_| "ConversionFailure".to_owned())?;
-    let mut list = String::new();
-    for line in text.lines() {
-        if !line.starts_with("file://") {
-            continue;
-        }
-        let decoded = percent_encoding::percent_decode_str(line)
-            .decode_utf8()
-            .map_err(|_| "ConversionFailure".to_owned())?;
-        list = list + "\n" + decoded.trim_start_matches("file://");
-    }
-    list = list.trim().to_owned();
-    Ok(list)
-}
-
-#[cfg(all(target_os = "linux", feature = "unix-file-copy-paste"))]
-impl ClipboardContext {
-    pub fn new() -> Result<Self, String> {
-        let clipboard = get_clipboard()?;
-        let string_getter = clipboard
-            .getter
-            .get_atom("UTF8_STRING")
-            .map_err(|e| e.to_string())?;
-        let string_setter = clipboard
-            .setter
-            .get_atom("UTF8_STRING")
-            .map_err(|e| e.to_string())?;
-        let text_uri_list = clipboard
-            .getter
-            .get_atom("text/uri-list")
-            .map_err(|e| e.to_string())?;
-        let prop = clipboard.getter.atoms.property;
-        let clip = clipboard.getter.atoms.clipboard;
-        Ok(Self {
-            text_uri_list,
-            string_setter,
-            string_getter,
-            clip,
-            prop,
-        })
-    }
-
-    pub fn get_text(&mut self) -> Result<String, String> {
-        let clip = self.clip;
-        let prop = self.prop;
-
-        const TIMEOUT: std::time::Duration = std::time::Duration::from_millis(120);
-
-        let text_content = get_clipboard()?
-            .load(clip, self.string_getter, prop, TIMEOUT)
-            .map_err(|e| e.to_string())?;
-
-        let file_urls = get_clipboard()?.load(clip, self.text_uri_list, prop, TIMEOUT);
-
-        if file_urls.is_err() || file_urls.as_ref().unwrap().is_empty() {
-            log::trace!("clipboard get text, no file urls");
-            return String::from_utf8(text_content).map_err(|e| e.to_string());
-        }
-
-        let file_urls = parse_plain_uri_list(file_urls.unwrap())?;
-
-        let text_content = String::from_utf8(text_content).map_err(|e| e.to_string())?;
-
-        if text_content.trim() == file_urls.trim() {
-            log::trace!("clipboard got text but polluted");
-            return Err(String::from("polluted text"));
-        }
-
-        Ok(text_content)
-    }
-
-    pub fn set_text(&mut self, content: String) -> Result<(), String> {
-        let clip = self.clip;
-
-        let value = content.clone().into_bytes();
-        get_clipboard()?
-            .store(clip, self.string_setter, value)
-            .map_err(|e| e.to_string())?;
-        Ok(())
-    }
-}
-
-#[cfg(not(any(target_os = "android", target_os = "ios")))]
-use hbb_common::compress::decompress;
-use hbb_common::{
-    allow_err,
-    anyhow::{anyhow, Context},
-    bail,
-    bytes::Bytes,
-    compress::compress as compress_func,
-    config::{self, Config, CONNECT_TIMEOUT, READ_TIMEOUT},
-    futures_util::future::poll_fn,
-    get_version_number, log,
-    message_proto::*,
-    protobuf::{Enum, Message as _},
-    rendezvous_proto::*,
-    socket_client,
-    sodiumoxide::crypto::{box_, secretbox, sign},
-    tcp::FramedStream,
-    timeout,
-    tokio::{
-        self,
-        time::{Duration, Instant, Interval},
-    },
-    ResultType,
-};
-// #[cfg(any(target_os = "android", target_os = "ios", feature = "cli"))]
-use hbb_common::{config::RENDEZVOUS_PORT, futures::future::join_all};
-
-use crate::ui_interface::{get_option, set_option};
-
 pub type NotifyMessageBox = fn(String, String, String, String) -> dyn Future<Output = ()>;
-
-pub const CLIPBOARD_NAME: &'static str = "clipboard";
-pub const CLIPBOARD_INTERVAL: u64 = 333;
-
-#[cfg(all(target_os = "macos", feature = "flutter_texture_render"))]
-// https://developer.apple.com/forums/thread/712709
-// Memory alignment should be multiple of 64.
-pub const DST_STRIDE_RGBA: usize = 64;
-#[cfg(not(all(target_os = "macos", feature = "flutter_texture_render")))]
-pub const DST_STRIDE_RGBA: usize = 1;
 
 // the executable name of the portable version
 pub const PORTABLE_APPNAME_RUNTIME_ENV_KEY: &str = "RUSTDESK_APPNAME";
@@ -166,6 +57,9 @@ pub const PLATFORM_WINDOWS: &str = "Windows";
 pub const PLATFORM_LINUX: &str = "Linux";
 pub const PLATFORM_MACOS: &str = "Mac OS";
 pub const PLATFORM_ANDROID: &str = "Android";
+
+pub const TIMER_OUT: Duration = Duration::from_secs(1);
+pub const DEFAULT_KEEP_ALIVE: i32 = 60_000;
 
 const MIN_VER_MULTI_UI_SESSION: &str = "1.2.4";
 
@@ -184,13 +78,10 @@ pub mod input {
 }
 
 lazy_static::lazy_static! {
-    pub static ref CONTENT: Arc<Mutex<String>> = Default::default();
     pub static ref SOFTWARE_UPDATE_URL: Arc<Mutex<String>> = Default::default();
-}
-
-lazy_static::lazy_static! {
     pub static ref DEVICE_ID: Arc<Mutex<String>> = Default::default();
     pub static ref DEVICE_NAME: Arc<Mutex<String>> = Default::default();
+    static ref PUBLIC_IPV6_ADDR: Arc<Mutex<(Option<SocketAddr>, Option<Instant>)>> = Default::default();
 }
 
 lazy_static::lazy_static! {
@@ -198,16 +89,13 @@ lazy_static::lazy_static! {
     static ref IS_SERVER: bool = std::env::args().nth(1) == Some("--server".to_owned());
     // Is server logic running. The server code can invoked to run by the main process if --server is not running.
     static ref SERVER_RUNNING: Arc<RwLock<bool>> = Default::default();
-}
-
-#[cfg(not(any(target_os = "android", target_os = "ios")))]
-lazy_static::lazy_static! {
-    static ref ARBOARD_MTX: Arc<Mutex<()>> = Arc::new(Mutex::new(()));
+    static ref IS_MAIN: bool = std::env::args().nth(1).map_or(true, |arg| !arg.starts_with("--"));
+    static ref IS_CM: bool = std::env::args().nth(1) == Some("--cm".to_owned()) || std::env::args().nth(1) == Some("--cm-no-ui".to_owned());
 }
 
 pub struct SimpleCallOnReturn {
     pub b: bool,
-    pub f: Box<dyn Fn() + 'static>,
+    pub f: Box<dyn Fn() + Send + 'static>,
 }
 
 impl Drop for SimpleCallOnReturn {
@@ -245,10 +133,50 @@ pub fn is_support_multi_ui_session_num(ver: i64) -> bool {
     ver >= hbb_common::get_version_number(MIN_VER_MULTI_UI_SESSION)
 }
 
+#[inline]
+#[cfg(feature = "unix-file-copy-paste")]
+pub fn is_support_file_copy_paste(ver: &str) -> bool {
+    is_support_file_copy_paste_num(hbb_common::get_version_number(ver))
+}
+
+#[inline]
+#[cfg(feature = "unix-file-copy-paste")]
+pub fn is_support_file_copy_paste_num(ver: i64) -> bool {
+    ver >= hbb_common::get_version_number("1.3.8")
+}
+
+pub fn is_support_remote_print(ver: &str) -> bool {
+    hbb_common::get_version_number(ver) >= hbb_common::get_version_number("1.3.9")
+}
+
+pub fn is_support_file_paste_if_macos(ver: &str) -> bool {
+    hbb_common::get_version_number(ver) >= hbb_common::get_version_number("1.3.9")
+}
+
+#[inline]
+pub fn is_support_screenshot(ver: &str) -> bool {
+    is_support_multi_ui_session_num(hbb_common::get_version_number(ver))
+}
+
+#[inline]
+pub fn is_support_screenshot_num(ver: i64) -> bool {
+    ver >= hbb_common::get_version_number("1.4.0")
+}
+
 // is server process, with "--server" args
 #[inline]
 pub fn is_server() -> bool {
     *IS_SERVER
+}
+
+#[inline]
+pub fn is_main() -> bool {
+    *IS_MAIN
+}
+
+#[inline]
+pub fn is_cm() -> bool {
+    *IS_CM
 }
 
 // Is server logic running.
@@ -266,48 +194,6 @@ pub fn valid_for_numlock(evt: &KeyEvent) -> bool {
     } else {
         false
     }
-}
-
-pub fn create_clipboard_msg(content: String) -> Message {
-    let bytes = content.into_bytes();
-    let compressed = compress_func(&bytes);
-    let compress = compressed.len() < bytes.len();
-    let content = if compress { compressed } else { bytes };
-    let mut msg = Message::new();
-    msg.set_clipboard(Clipboard {
-        compress,
-        content: content.into(),
-        ..Default::default()
-    });
-    msg
-}
-
-#[cfg(not(any(target_os = "android", target_os = "ios")))]
-pub fn check_clipboard(
-    ctx: &mut Option<ClipboardContext>,
-    old: Option<&Arc<Mutex<String>>>,
-) -> Option<Message> {
-    if ctx.is_none() {
-        *ctx = ClipboardContext::new().ok();
-    }
-    let ctx2 = ctx.as_mut()?;
-    let side = if old.is_none() { "host" } else { "client" };
-    let old = if let Some(old) = old { old } else { &CONTENT };
-    let content = {
-        let _lock = ARBOARD_MTX.lock().unwrap();
-        ctx2.get_text()
-    };
-    if let Ok(content) = content {
-        if content.len() < 2_000_000 && !content.is_empty() {
-            let changed = content != *old.lock().unwrap();
-            if changed {
-                log::info!("{} update found on {}", CLIPBOARD_NAME, side);
-                *old.lock().unwrap() = content.clone();
-                return Some(create_clipboard_msg(content));
-            }
-        }
-    }
-    None
 }
 
 /// Set sound input device.
@@ -356,34 +242,6 @@ pub fn get_default_sound_input() -> Option<String> {
 #[cfg(any(target_os = "android", target_os = "ios"))]
 pub fn get_default_sound_input() -> Option<String> {
     None
-}
-
-#[cfg(not(any(target_os = "android", target_os = "ios")))]
-pub fn update_clipboard(clipboard: Clipboard, old: Option<&Arc<Mutex<String>>>) {
-    let content = if clipboard.compress {
-        decompress(&clipboard.content)
-    } else {
-        clipboard.content.into()
-    };
-    if let Ok(content) = String::from_utf8(content) {
-        if content.is_empty() {
-            // ctx.set_text may crash if content is empty
-            return;
-        }
-        match ClipboardContext::new() {
-            Ok(mut ctx) => {
-                let side = if old.is_none() { "host" } else { "client" };
-                let old = if let Some(old) = old { old } else { &CONTENT };
-                *old.lock().unwrap() = content.clone();
-                let _lock = ARBOARD_MTX.lock().unwrap();
-                allow_err!(ctx.set_text(content));
-                log::debug!("{} updated on {}", CLIPBOARD_NAME, side);
-            }
-            Err(err) => {
-                log::error!("Failed to create clipboard context: {}", err);
-            }
-        }
-    }
 }
 
 #[cfg(feature = "use_rubato")]
@@ -650,41 +508,74 @@ audio_rechannel!(audio_rechannel_8_5, 8, 5);
 audio_rechannel!(audio_rechannel_8_6, 8, 6);
 audio_rechannel!(audio_rechannel_8_7, 8, 7);
 
+pub struct CheckTestNatType {
+    is_direct: bool,
+}
+
+impl CheckTestNatType {
+    pub fn new() -> Self {
+        Self {
+            is_direct: Config::get_socks().is_none() && !config::use_ws(),
+        }
+    }
+}
+
+impl Drop for CheckTestNatType {
+    fn drop(&mut self) {
+        let is_direct = Config::get_socks().is_none() && !config::use_ws();
+        if self.is_direct != is_direct {
+            test_nat_type();
+        }
+    }
+}
+
 pub fn test_nat_type() {
-    let mut i = 0;
-    std::thread::spawn(move || loop {
-        match test_nat_type_() {
-            Ok(true) => break,
-            Err(err) => {
-                log::error!("test nat: {}", err);
+    test_ipv6_sync();
+    use std::sync::atomic::{AtomicBool, Ordering};
+    std::thread::spawn(move || {
+        static IS_RUNNING: AtomicBool = AtomicBool::new(false);
+        if IS_RUNNING.load(Ordering::SeqCst) {
+            return;
+        }
+        IS_RUNNING.store(true, Ordering::SeqCst);
+
+        #[cfg(not(any(target_os = "android", target_os = "ios")))]
+        crate::ipc::get_socks_ws();
+        let is_direct = Config::get_socks().is_none() && !config::use_ws();
+        if !is_direct {
+            Config::set_nat_type(NatType::SYMMETRIC as _);
+            IS_RUNNING.store(false, Ordering::SeqCst);
+            return;
+        }
+
+        let mut i = 0;
+        loop {
+            match test_nat_type_() {
+                Ok(true) => break,
+                Err(err) => {
+                    log::error!("test nat: {}", err);
+                }
+                _ => {}
             }
-            _ => {}
+            if Config::get_nat_type() != 0 {
+                break;
+            }
+            i = i * 2 + 1;
+            if i > 300 {
+                i = 300;
+            }
+            std::thread::sleep(std::time::Duration::from_secs(i));
         }
-        if Config::get_nat_type() != 0 {
-            break;
-        }
-        i = i * 2 + 1;
-        if i > 300 {
-            i = 300;
-        }
-        std::thread::sleep(std::time::Duration::from_secs(i));
+
+        IS_RUNNING.store(false, Ordering::SeqCst);
     });
 }
 
 #[tokio::main(flavor = "current_thread")]
 async fn test_nat_type_() -> ResultType<bool> {
     log::info!("Testing nat ...");
-    #[cfg(not(any(target_os = "android", target_os = "ios")))]
-    let is_direct = crate::ipc::get_socks_async(1_000).await.is_none(); // sync socks BTW
-    #[cfg(any(target_os = "android", target_os = "ios"))]
-    let is_direct = Config::get_socks().is_none(); // sync socks BTW
-    if !is_direct {
-        Config::set_nat_type(NatType::SYMMETRIC as _);
-        return Ok(true);
-    }
     let start = std::time::Instant::now();
-    let (rendezvous_server, _, _) = get_rendezvous_server(1_000).await;
-    let server1 = rendezvous_server;
+    let server1 = Config::get_rendezvous_server();
     let server2 = crate::increase_port(&server1, -1);
     let mut msg_out = RendezvousMessage::new();
     let serial = Config::get_serial();
@@ -839,18 +730,41 @@ pub fn refresh_rendezvous_server() {
 }
 
 pub fn run_me<T: AsRef<std::ffi::OsStr>>(args: Vec<T>) -> std::io::Result<std::process::Child> {
-    #[cfg(not(feature = "appimage"))]
-    {
-        let cmd = std::env::current_exe()?;
-        return std::process::Command::new(cmd).args(&args).spawn();
-    }
-    #[cfg(feature = "appimage")]
-    {
-        let appdir = std::env::var("APPDIR").map_err(|_| std::io::ErrorKind::Other)?;
+    #[cfg(target_os = "linux")]
+    if let Ok(appdir) = std::env::var("APPDIR") {
         let appimage_cmd = std::path::Path::new(&appdir).join("AppRun");
-        log::info!("path: {:?}", appimage_cmd);
-        return std::process::Command::new(appimage_cmd).args(&args).spawn();
+        if appimage_cmd.exists() {
+            log::info!("path: {:?}", appimage_cmd);
+            return std::process::Command::new(appimage_cmd).args(&args).spawn();
+        }
     }
+    let cmd = std::env::current_exe()?;
+    let mut cmd = std::process::Command::new(cmd);
+    #[cfg(windows)]
+    let mut force_foreground = false;
+    #[cfg(windows)]
+    {
+        let arg_strs = args
+            .iter()
+            .map(|x| x.as_ref().to_string_lossy())
+            .collect::<Vec<_>>();
+        if arg_strs == vec!["--install"] || arg_strs == &["--noinstall"] {
+            cmd.env(crate::platform::SET_FOREGROUND_WINDOW, "1");
+            force_foreground = true;
+        }
+    }
+    let result = cmd.args(&args).spawn();
+    match result.as_ref() {
+        Ok(_child) =>
+        {
+            #[cfg(windows)]
+            if force_foreground {
+                unsafe { winapi::um::winuser::AllowSetForegroundWindow(_child.id() as u32) };
+            }
+        }
+        Err(err) => log::error!("run_me: {err:?}"),
+    }
+    result
 }
 
 #[inline]
@@ -862,12 +776,22 @@ pub fn username() -> String {
     return DEVICE_NAME.lock().unwrap().clone();
 }
 
+// Exactly the implementation of "whoami::hostname()".
+// This wrapper is to suppress warnings.
+#[inline(always)]
+#[cfg(not(target_os = "ios"))]
+pub fn whoami_hostname() -> String {
+    let mut hostname = whoami::fallible::hostname().unwrap_or_else(|_| "localhost".to_string());
+    hostname.make_ascii_lowercase();
+    hostname
+}
+
 #[inline]
 pub fn hostname() -> String {
     #[cfg(not(any(target_os = "android", target_os = "ios")))]
     {
         #[allow(unused_mut)]
-        let mut name = whoami::hostname();
+        let mut name = whoami_hostname();
         // some time, there is .local, some time not, so remove it for osx
         #[cfg(target_os = "macos")]
         if name.ends_with(".local") {
@@ -906,7 +830,6 @@ pub fn get_sysinfo() -> serde_json::Value {
         os = format!("{os} - {}", system.os_version().unwrap_or_default());
     }
     let hostname = hostname(); // sys.hostname() return localhost on android in my test
-    use serde_json::json;
     #[cfg(any(target_os = "android", target_os = "ios"))]
     let out;
     #[cfg(not(any(target_os = "android", target_os = "ios")))]
@@ -966,24 +889,42 @@ pub fn is_modifier(evt: &KeyEvent) -> bool {
 }
 
 pub fn check_software_update() {
-    std::thread::spawn(move || allow_err!(check_software_update_()));
+    if is_custom_client() {
+        return;
+    }
+    let opt = LocalConfig::get_option(keys::OPTION_ENABLE_CHECK_UPDATE);
+    if config::option2bool(keys::OPTION_ENABLE_CHECK_UPDATE, &opt) {
+        std::thread::spawn(move || allow_err!(do_check_software_update()));
+    }
 }
 
 #[tokio::main(flavor = "current_thread")]
-async fn check_software_update_() -> hbb_common::ResultType<()> {
-    let url = "https://github.com/rustdesk/rustdesk/releases/latest";
-    let latest_release_response = reqwest::get(url).await?;
-    let latest_release_version = latest_release_response
-        .url()
-        .path()
-        .rsplit('/')
-        .next()
-        .unwrap_or_default();
-
-    let response_url = latest_release_response.url().to_string();
+pub async fn do_check_software_update() -> hbb_common::ResultType<()> {
+    let (request, url) =
+        hbb_common::version_check_request(hbb_common::VER_TYPE_RUSTDESK_CLIENT.to_string());
+    let latest_release_response = create_http_client_async()
+        .post(url)
+        .json(&request)
+        .send()
+        .await?;
+    let bytes = latest_release_response.bytes().await?;
+    let resp: hbb_common::VersionCheckResponse = serde_json::from_slice(&bytes)?;
+    let response_url = resp.url;
+    let latest_release_version = response_url.rsplit('/').next().unwrap_or_default();
 
     if get_version_number(&latest_release_version) > get_version_number(crate::VERSION) {
+        #[cfg(feature = "flutter")]
+        {
+            let mut m = HashMap::new();
+            m.insert("name", "check_software_update_finish");
+            m.insert("url", &response_url);
+            if let Ok(data) = serde_json::to_string(&m) {
+                let _ = crate::flutter::push_global_event(crate::flutter::APP_TYPE_MAIN, data);
+            }
+        }
         *SOFTWARE_UPDATE_URL.lock().unwrap() = response_url;
+    } else {
+        *SOFTWARE_UPDATE_URL.lock().unwrap() = "".to_string();
     }
     Ok(())
 }
@@ -1032,7 +973,25 @@ pub fn get_custom_rendezvous_server(custom: String) -> String {
     "".to_owned()
 }
 
+#[inline]
 pub fn get_api_server(api: String, custom: String) -> String {
+    if Config::no_register_device() {
+        return "".to_owned();
+    }
+    let mut res = get_api_server_(api, custom);
+    if res.ends_with('/') {
+        res.pop();
+    }
+    if res.starts_with("https")
+        && res.ends_with(":21114")
+        && get_builtin_option(keys::OPTION_ALLOW_HTTPS_21114) != "Y"
+    {
+        return res.replace(":21114", "");
+    }
+    res
+}
+
+fn get_api_server_(api: String, custom: String) -> String {
     #[cfg(windows)]
     if let Ok(lic) = crate::platform::windows::get_license_from_exe_name() {
         if !lic.api.is_empty() {
@@ -1058,16 +1017,47 @@ pub fn get_api_server(api: String, custom: String) -> String {
     "https://admin.rustdesk.com".to_owned()
 }
 
+#[inline]
+pub fn is_public(url: &str) -> bool {
+    url.contains("rustdesk.com")
+}
+
+pub fn get_udp_punch_enabled() -> bool {
+    config::option2bool(
+        keys::OPTION_ENABLE_UDP_PUNCH,
+        &get_local_option(keys::OPTION_ENABLE_UDP_PUNCH),
+    )
+}
+
+pub fn get_ipv6_punch_enabled() -> bool {
+    config::option2bool(
+        keys::OPTION_ENABLE_IPV6_PUNCH,
+        &get_local_option(keys::OPTION_ENABLE_IPV6_PUNCH),
+    )
+}
+
+pub fn get_local_option(key: &str) -> String {
+    let v = LocalConfig::get_option(key);
+    if key == keys::OPTION_ENABLE_UDP_PUNCH || key == keys::OPTION_ENABLE_IPV6_PUNCH {
+        if v.is_empty() {
+            if !is_public(&Config::get_rendezvous_server()) {
+                return "N".to_owned();
+            }
+        }
+    }
+    v
+}
+
 pub fn get_audit_server(api: String, custom: String, typ: String) -> String {
     let url = get_api_server(api, custom);
-    if url.is_empty() || url.contains("rustdesk.com") {
+    if url.is_empty() || is_public(&url) {
         return "".to_owned();
     }
     format!("{}/api/audit/{}", url, typ)
 }
 
 pub async fn post_request(url: String, body: String, header: &str) -> ResultType<String> {
-    let mut req = reqwest::Client::new().post(url);
+    let mut req = create_http_client_async().post(url);
     if !header.is_empty() {
         let tmp: Vec<&str> = header.split(": ").collect();
         if tmp.len() == 2 {
@@ -1082,6 +1072,65 @@ pub async fn post_request(url: String, body: String, header: &str) -> ResultType
 #[tokio::main(flavor = "current_thread")]
 pub async fn post_request_sync(url: String, body: String, header: &str) -> ResultType<String> {
     post_request(url, body, header).await
+}
+
+#[tokio::main(flavor = "current_thread")]
+pub async fn http_request_sync(
+    url: String,
+    method: String,
+    body: Option<String>,
+    header: String,
+) -> ResultType<String> {
+    let http_client = create_http_client_async();
+    let mut http_client = match method.as_str() {
+        "get" => http_client.get(url),
+        "post" => http_client.post(url),
+        "put" => http_client.put(url),
+        "delete" => http_client.delete(url),
+        _ => return Err(anyhow!("The HTTP request method is not supported!")),
+    };
+    let v = serde_json::from_str(header.as_str())?;
+
+    if let Value::Object(obj) = v {
+        for (key, value) in obj.iter() {
+            http_client = http_client.header(key, value.as_str().unwrap_or_default());
+        }
+    } else {
+        return Err(anyhow!("HTTP header information parsing failed!"));
+    }
+
+    if let Some(b) = body {
+        http_client = http_client.body(b);
+    }
+
+    let response = http_client
+        .timeout(std::time::Duration::from_secs(12))
+        .send()
+        .await?;
+
+    // Serialize response headers
+    let mut response_headers = serde_json::map::Map::new();
+    for (key, value) in response.headers() {
+        response_headers.insert(
+            key.to_string(),
+            serde_json::json!(value.to_str().unwrap_or("")),
+        );
+    }
+
+    let status_code = response.status().as_u16();
+    let response_body = response.text().await?;
+
+    // Construct the JSON object
+    let mut result = serde_json::map::Map::new();
+    result.insert("status_code".to_string(), serde_json::json!(status_code));
+    result.insert(
+        "headers".to_string(),
+        serde_json::Value::Object(response_headers),
+    );
+    result.insert("body".to_string(), serde_json::json!(response_body));
+
+    // Convert map to JSON string
+    serde_json::to_string(&result).map_err(|e| anyhow!("Failed to serialize response: {}", e))
 }
 
 #[inline]
@@ -1138,7 +1187,11 @@ pub fn get_supported_keyboard_modes(version: i64, peer_platform: &str) -> Vec<Ke
 }
 
 pub fn make_fd_to_json(id: i32, path: String, entries: &Vec<FileEntry>) -> String {
-    use serde_json::json;
+    let fd_json = _make_fd_to_json(id, path, entries);
+    serde_json::to_string(&fd_json).unwrap_or("".into())
+}
+
+pub fn _make_fd_to_json(id: i32, path: String, entries: &Vec<FileEntry>) -> Map<String, Value> {
     let mut fd_json = serde_json::Map::new();
     fd_json.insert("id".into(), json!(id));
     fd_json.insert("path".into(), json!(path));
@@ -1153,7 +1206,33 @@ pub fn make_fd_to_json(id: i32, path: String, entries: &Vec<FileEntry>) -> Strin
         entries_out.push(entry_map);
     }
     fd_json.insert("entries".into(), json!(entries_out));
-    serde_json::to_string(&fd_json).unwrap_or("".into())
+    fd_json
+}
+
+pub fn make_vec_fd_to_json(fds: &[FileDirectory]) -> String {
+    let mut fd_jsons = vec![];
+
+    for fd in fds.iter() {
+        let fd_json = _make_fd_to_json(fd.id, fd.path.clone(), &fd.entries);
+        fd_jsons.push(fd_json);
+    }
+
+    serde_json::to_string(&fd_jsons).unwrap_or("".into())
+}
+
+pub fn make_empty_dirs_response_to_json(res: &ReadEmptyDirsResponse) -> String {
+    let mut map: Map<String, Value> = serde_json::Map::new();
+    map.insert("path".into(), json!(res.path));
+
+    let mut fd_jsons = vec![];
+
+    for fd in res.empty_dirs.iter() {
+        let fd_json = _make_fd_to_json(fd.id, fd.path.clone(), &fd.entries);
+        fd_jsons.push(fd_json);
+    }
+    map.insert("empty_dirs".into(), fd_jsons.into());
+
+    serde_json::to_string(&map).unwrap_or("".into())
 }
 
 /// The function to handle the url scheme sent by the system.
@@ -1218,7 +1297,7 @@ pub fn pk_to_fingerprint(pk: Vec<u8>) -> String {
 
 #[inline]
 pub async fn get_next_nonkeyexchange_msg(
-    conn: &mut FramedStream,
+    conn: &mut Stream,
     timeout: Option<u64>,
 ) -> Option<RendezvousMessage> {
     let timeout = timeout.unwrap_or(READ_TIMEOUT);
@@ -1240,7 +1319,34 @@ pub async fn get_next_nonkeyexchange_msg(
     None
 }
 
+#[cfg(all(target_os = "windows", not(target_pointer_width = "64")))]
+pub fn check_process(arg: &str, same_session_id: bool) -> bool {
+    let mut path = std::env::current_exe().unwrap_or_default();
+    if let Ok(linked) = path.read_link() {
+        path = linked;
+    }
+    let Some(filename) = path.file_name() else {
+        return false;
+    };
+    let filename = filename.to_string_lossy().to_string();
+    match crate::platform::windows::get_pids_with_first_arg_check_session(
+        &filename,
+        arg,
+        same_session_id,
+    ) {
+        Ok(pids) => {
+            let self_pid = hbb_common::sysinfo::Pid::from_u32(std::process::id());
+            pids.into_iter().filter(|pid| *pid != self_pid).count() > 0
+        }
+        Err(e) => {
+            log::error!("Failed to check process with arg: \"{}\", {}", arg, e);
+            false
+        }
+    }
+}
+
 #[allow(unused_mut)]
+#[cfg(not(all(target_os = "windows", not(target_pointer_width = "64"))))]
 #[cfg(not(any(target_os = "android", target_os = "ios")))]
 pub fn check_process(arg: &str, mut same_uid: bool) -> bool {
     #[cfg(target_os = "macos")]
@@ -1287,7 +1393,14 @@ pub fn check_process(arg: &str, mut same_uid: bool) -> bool {
     false
 }
 
-pub async fn secure_tcp(conn: &mut FramedStream, key: &str) -> ResultType<()> {
+pub async fn secure_tcp(conn: &mut Stream, key: &str) -> ResultType<()> {
+    // Skip additional encryption when using WebSocket connections (wss://)
+    // as WebSocket Secure (wss://) already provides transport layer encryption.
+    // This doesn't affect the end-to-end encryption between clients,
+    // it only avoids redundant encryption between client and server.
+    if use_ws() {
+        return Ok(());
+    }
     let rs_pk = get_rs_pk(key);
     let Some(rs_pk) = rs_pk else {
         bail!("Handshake failed: invalid public key from rendezvous server");
@@ -1372,7 +1485,7 @@ pub fn using_public_server() -> bool {
 
 pub struct ThrottledInterval {
     interval: Interval,
-    last_tick: Instant,
+    next_tick: Instant,
     min_interval: Duration,
 }
 
@@ -1381,7 +1494,7 @@ impl ThrottledInterval {
         let period = i.period();
         ThrottledInterval {
             interval: i,
-            last_tick: Instant::now() - period * 2,
+            next_tick: Instant::now(),
             min_interval: Duration::from_secs_f64(period.as_secs_f64() * 0.9),
         }
     }
@@ -1394,8 +1507,9 @@ impl ThrottledInterval {
     pub fn poll_tick(&mut self, cx: &mut std::task::Context<'_>) -> Poll<Instant> {
         match self.interval.poll_tick(cx) {
             Poll::Ready(instant) => {
-                if self.last_tick.elapsed() >= self.min_interval {
-                    self.last_tick = Instant::now();
+                let now = Instant::now();
+                if self.next_tick <= now {
+                    self.next_tick = now + self.min_interval;
                     Poll::Ready(instant)
                 } else {
                     // This call is required since tokio 1.27
@@ -1413,78 +1527,6 @@ pub type RustDeskInterval = ThrottledInterval;
 #[inline]
 pub fn rustdesk_interval(i: Interval) -> ThrottledInterval {
     ThrottledInterval::new(i)
-}
-
-#[cfg(not(any(
-    target_os = "android",
-    target_os = "ios",
-    all(target_os = "linux", feature = "unix-file-copy-paste")
-)))]
-pub struct ClipboardContext(arboard::Clipboard);
-
-#[cfg(not(any(
-    target_os = "android",
-    target_os = "ios",
-    all(target_os = "linux", feature = "unix-file-copy-paste")
-)))]
-impl ClipboardContext {
-    #[inline]
-    #[cfg(any(target_os = "windows", target_os = "macos"))]
-    pub fn new() -> ResultType<ClipboardContext> {
-        Ok(ClipboardContext(arboard::Clipboard::new()?))
-    }
-
-    #[cfg(target_os = "linux")]
-    pub fn new() -> ResultType<ClipboardContext> {
-        let dur = arboard::Clipboard::get_x11_server_conn_timeout();
-        let dur_bak = dur;
-        let _restore_timeout_on_ret = SimpleCallOnReturn {
-            b: true,
-            f: Box::new(move || arboard::Clipboard::set_x11_server_conn_timeout(dur_bak)),
-        };
-
-        for i in 1..4 {
-            arboard::Clipboard::set_x11_server_conn_timeout(dur * i);
-            match arboard::Clipboard::new() {
-                Ok(c) => return Ok(ClipboardContext(c)),
-                Err(arboard::Error::X11ServerConnTimeout) => continue,
-                Err(err) => return Err(err.into()),
-            }
-        }
-        bail!("Failed to create clipboard context, timeout");
-    }
-
-    #[inline]
-    #[cfg(any(target_os = "windows", target_os = "macos"))]
-    pub fn get_text(&mut self) -> ResultType<String> {
-        Ok(self.0.get_text()?)
-    }
-
-    #[cfg(target_os = "linux")]
-    pub fn get_text(&mut self) -> ResultType<String> {
-        let dur = arboard::Clipboard::get_x11_server_conn_timeout();
-        let dur_bak = dur;
-        let _restore_timeout_on_ret = SimpleCallOnReturn {
-            b: true,
-            f: Box::new(move || arboard::Clipboard::set_x11_server_conn_timeout(dur_bak)),
-        };
-
-        for i in 1..4 {
-            arboard::Clipboard::set_x11_server_conn_timeout(dur * i);
-            match self.0.get_text() {
-                Ok(s) => return Ok(s),
-                Err(arboard::Error::X11ServerConnTimeout) => continue,
-                Err(err) => return Err(err.into()),
-            }
-        }
-        bail!("Failed to get text, timeout");
-    }
-
-    #[inline]
-    pub fn set_text<'a, T: Into<Cow<'a, str>>>(&mut self, text: T) -> ResultType<()> {
-        self.0.set_text(text)?;
-        Ok(())
-    }
 }
 
 pub fn load_custom_client() {
@@ -1507,6 +1549,82 @@ pub fn load_custom_client() {
         };
         read_custom_client(&data.trim());
     }
+}
+
+fn read_custom_client_advanced_settings(
+    settings: serde_json::Value,
+    map_display_settings: &HashMap<String, &&str>,
+    map_local_settings: &HashMap<String, &&str>,
+    map_settings: &HashMap<String, &&str>,
+    map_buildin_settings: &HashMap<String, &&str>,
+    is_override: bool,
+) {
+    let mut display_settings = if is_override {
+        config::OVERWRITE_DISPLAY_SETTINGS.write().unwrap()
+    } else {
+        config::DEFAULT_DISPLAY_SETTINGS.write().unwrap()
+    };
+    let mut local_settings = if is_override {
+        config::OVERWRITE_LOCAL_SETTINGS.write().unwrap()
+    } else {
+        config::DEFAULT_LOCAL_SETTINGS.write().unwrap()
+    };
+    let mut server_settings = if is_override {
+        config::OVERWRITE_SETTINGS.write().unwrap()
+    } else {
+        config::DEFAULT_SETTINGS.write().unwrap()
+    };
+    let mut buildin_settings = config::BUILTIN_SETTINGS.write().unwrap();
+
+    if let Some(settings) = settings.as_object() {
+        for (k, v) in settings {
+            let Some(v) = v.as_str() else {
+                continue;
+            };
+            if let Some(k2) = map_display_settings.get(k) {
+                display_settings.insert(k2.to_string(), v.to_owned());
+            } else if let Some(k2) = map_local_settings.get(k) {
+                local_settings.insert(k2.to_string(), v.to_owned());
+            } else if let Some(k2) = map_settings.get(k) {
+                server_settings.insert(k2.to_string(), v.to_owned());
+            } else if let Some(k2) = map_buildin_settings.get(k) {
+                buildin_settings.insert(k2.to_string(), v.to_owned());
+            } else {
+                let k2 = k.replace("_", "-");
+                let k = k2.replace("-", "_");
+                // display
+                display_settings.insert(k.clone(), v.to_owned());
+                display_settings.insert(k2.clone(), v.to_owned());
+                // local
+                local_settings.insert(k.clone(), v.to_owned());
+                local_settings.insert(k2.clone(), v.to_owned());
+                // server
+                server_settings.insert(k.clone(), v.to_owned());
+                server_settings.insert(k2.clone(), v.to_owned());
+                // buildin
+                buildin_settings.insert(k.clone(), v.to_owned());
+                buildin_settings.insert(k2.clone(), v.to_owned());
+            }
+        }
+    }
+}
+
+#[inline]
+#[cfg(target_os = "macos")]
+pub fn get_dst_align_rgba() -> usize {
+    // https://developer.apple.com/forums/thread/712709
+    // Memory alignment should be multiple of 64.
+    if crate::ui_interface::use_texture_render() {
+        64
+    } else {
+        1
+    }
+}
+
+#[inline]
+#[cfg(not(target_os = "macos"))]
+pub fn get_dst_align_rgba() -> usize {
+    1
 }
 
 pub fn read_custom_client(config: &str) {
@@ -1535,55 +1653,42 @@ pub fn read_custom_client(config: &str) {
             *config::APP_NAME.write().unwrap() = app_name.to_owned();
         }
     }
+
+    let mut map_display_settings = HashMap::new();
+    for s in keys::KEYS_DISPLAY_SETTINGS {
+        map_display_settings.insert(s.replace("_", "-"), s);
+    }
+    let mut map_local_settings = HashMap::new();
+    for s in keys::KEYS_LOCAL_SETTINGS {
+        map_local_settings.insert(s.replace("_", "-"), s);
+    }
+    let mut map_settings = HashMap::new();
+    for s in keys::KEYS_SETTINGS {
+        map_settings.insert(s.replace("_", "-"), s);
+    }
+    let mut buildin_settings = HashMap::new();
+    for s in keys::KEYS_BUILDIN_SETTINGS {
+        buildin_settings.insert(s.replace("_", "-"), s);
+    }
     if let Some(default_settings) = data.remove("default-settings") {
-        if let Some(default_settings) = default_settings.as_object() {
-            for (k, v) in default_settings {
-                let Some(v) = v.as_str() else {
-                    continue;
-                };
-                if k.starts_with("$$") {
-                    config::DEFAULT_DISPLAY_SETTINGS
-                        .write()
-                        .unwrap()
-                        .insert(k.clone(), v[2..].to_owned());
-                } else if k.starts_with("$") {
-                    config::DEFAULT_LOCAL_SETTINGS
-                        .write()
-                        .unwrap()
-                        .insert(k.clone(), v[1..].to_owned());
-                } else {
-                    config::DEFAULT_SETTINGS
-                        .write()
-                        .unwrap()
-                        .insert(k.clone(), v.to_owned());
-                }
-            }
-        }
+        read_custom_client_advanced_settings(
+            default_settings,
+            &map_display_settings,
+            &map_local_settings,
+            &map_settings,
+            &buildin_settings,
+            false,
+        );
     }
     if let Some(overwrite_settings) = data.remove("override-settings") {
-        if let Some(overwrite_settings) = overwrite_settings.as_object() {
-            for (k, v) in overwrite_settings {
-                let Some(v) = v.as_str() else {
-                    continue;
-                };
-                if k.starts_with("$$") {
-                    config::OVERWRITE_DISPLAY_SETTINGS
-                        .write()
-                        .unwrap()
-                        .insert(k.clone(), v[2..].to_owned());
-                } else if k.starts_with("$") {
-                    config::OVERWRITE_LOCAL_SETTINGS
-                        .write()
-                        .unwrap()
-                        .insert(k.clone(), v[1..].to_owned());
-                } else {
-                    config::OVERWRITE_SETTINGS
-                        .write()
-                        .unwrap()
-                        .insert(k.clone(), v.to_owned());
-                }
-            }
-        }
+        read_custom_client_advanced_settings(
+            overwrite_settings,
+            &map_display_settings,
+            &map_local_settings,
+            &map_settings,
+            &buildin_settings,
+            true,
+        );
     }
     for (k, v) in data {
         if let Some(v) = v.as_str() {
@@ -1593,6 +1698,336 @@ pub fn read_custom_client(config: &str) {
                 .insert(k, v.to_owned());
         };
     }
+}
+
+#[inline]
+pub fn is_empty_uni_link(arg: &str) -> bool {
+    let prefix = crate::get_uri_prefix();
+    if !arg.starts_with(&prefix) {
+        return false;
+    }
+    arg[prefix.len()..].chars().all(|c| c == '/')
+}
+
+pub fn get_hwid() -> Bytes {
+    use hbb_common::sha2::{Digest, Sha256};
+
+    let uuid = hbb_common::get_uuid();
+    let mut hasher = Sha256::new();
+    hasher.update(&uuid);
+    Bytes::from(hasher.finalize().to_vec())
+}
+
+#[inline]
+pub fn get_builtin_option(key: &str) -> String {
+    config::BUILTIN_SETTINGS
+        .read()
+        .unwrap()
+        .get(key)
+        .cloned()
+        .unwrap_or_default()
+}
+
+#[inline]
+pub fn is_custom_client() -> bool {
+    get_app_name() != "RustDesk"
+}
+
+pub fn verify_login(_raw: &str, _id: &str) -> bool {
+    true
+    /*
+    if is_custom_client() {
+        return true;
+    }
+    #[cfg(debug_assertions)]
+    return true;
+    let Ok(pk) = crate::decode64("IycjQd4TmWvjjLnYd796Rd+XkK+KG+7GU1Ia7u4+vSw=") else {
+        return false;
+    };
+    let Some(key) = get_pk(&pk).map(|x| sign::PublicKey(x)) else {
+        return false;
+    };
+    let Ok(v) = crate::decode64(raw) else {
+        return false;
+    };
+    let raw = sign::verify(&v, &key).unwrap_or_default();
+    let v_str = std::str::from_utf8(&raw)
+        .unwrap_or_default()
+        .split(":")
+        .next()
+        .unwrap_or_default();
+    v_str == id
+    */
+}
+
+#[inline]
+pub fn is_udp_disabled() -> bool {
+    get_builtin_option(keys::OPTION_DISABLE_UDP) == "Y"
+}
+
+// this crate https://github.com/yoshd/stun-client supports nat type
+async fn stun_ipv6_test(stun_server: &str) -> ResultType<(SocketAddr, String)> {
+    use std::net::ToSocketAddrs;
+    use stunclient::StunClient;
+    let local_addr = SocketAddr::from(([0u16; 8], 0)); // [::]:0
+    let socket = UdpSocket::bind(&local_addr).await?;
+    let Some(stun_addr) = stun_server
+        .to_socket_addrs()?
+        .filter(|x| x.is_ipv6())
+        .next()
+    else {
+        bail!(
+            "Failed to resolve STUN ipv6 server address: {}",
+            stun_server
+        );
+    };
+    let client = StunClient::new(stun_addr);
+    let addr = client.query_external_address_async(&socket).await?;
+    Ok(if addr.ip().is_ipv6() {
+        (addr, stun_server.to_owned())
+    } else {
+        bail!("STUN server returned non-IPv6 address: {}", addr)
+    })
+}
+
+async fn stun_ipv4_test(stun_server: &str) -> ResultType<(SocketAddr, String)> {
+    use std::net::ToSocketAddrs;
+    use stunclient::StunClient;
+    let local_addr = SocketAddr::from(([0u8; 4], 0));
+    let socket = UdpSocket::bind(&local_addr).await?;
+    let Some(stun_addr) = stun_server
+        .to_socket_addrs()?
+        .filter(|x| x.is_ipv4())
+        .next()
+    else {
+        bail!(
+            "Failed to resolve STUN ipv4 server address: {}",
+            stun_server
+        );
+    };
+    let client = StunClient::new(stun_addr);
+    let addr = client.query_external_address_async(&socket).await?;
+    Ok(if addr.ip().is_ipv4() {
+        (addr, stun_server.to_owned())
+    } else {
+        bail!("STUN server returned non-IPv6 address: {}", addr)
+    })
+}
+
+static STUNS_V4: [&str; 3] = [
+    "stun.l.google.com:19302",
+    "stun.cloudflare.com:3478",
+    "stun.nextcloud.com:3478",
+];
+
+static STUNS_V6: [&str; 3] = [
+    "stun.l.google.com:19302",
+    "stun.cloudflare.com:3478",
+    "stun.nextcloud.com:3478",
+];
+
+pub async fn test_nat_ipv4() -> ResultType<(SocketAddr, String)> {
+    use hbb_common::futures::future::{select_ok, FutureExt};
+    let tests = STUNS_V4
+        .iter()
+        .map(|&stun| stun_ipv4_test(stun).boxed())
+        .collect::<Vec<_>>();
+
+    match select_ok(tests).await {
+        Ok(res) => {
+            return Ok(res.0);
+        }
+        Err(e) => {
+            bail!(
+                "Failed to get public IPv4 address via public STUN servers: {}",
+                e
+            );
+        }
+    };
+}
+
+async fn test_bind_ipv6() -> ResultType<SocketAddr> {
+    let local_addr = SocketAddr::from(([0u16; 8], 0)); // [::]:0
+    let socket = UdpSocket::bind(local_addr).await?;
+    let addr = STUNS_V6[0]
+        .to_socket_addrs()?
+        .filter(|x| x.is_ipv6())
+        .next()
+        .ok_or_else(|| {
+            anyhow!(
+                "Failed to resolve STUN ipv6 server address: {}",
+                STUNS_V6[0]
+            )
+        })?;
+    socket.connect(addr).await?;
+    Ok(socket.local_addr()?)
+}
+
+pub async fn test_ipv6() -> Option<tokio::task::JoinHandle<()>> {
+    if PUBLIC_IPV6_ADDR
+        .lock()
+        .unwrap()
+        .1
+        .map(|x| x.elapsed().as_secs() < 60)
+        .unwrap_or(false)
+    {
+        return None;
+    }
+    PUBLIC_IPV6_ADDR.lock().unwrap().1 = Some(Instant::now());
+
+    match test_bind_ipv6().await {
+        Ok(mut addr) => {
+            if let std::net::IpAddr::V6(ip) = addr.ip() {
+                if !ip.is_loopback()
+                    && !ip.is_unspecified()
+                    && !ip.is_multicast()
+                    && (ip.segments()[0] & 0xe000) == 0x2000
+                {
+                    addr.set_port(0);
+                    PUBLIC_IPV6_ADDR.lock().unwrap().0 = Some(addr);
+                    log::debug!("Found public IPv6 address locally: {}", addr);
+                }
+            }
+        }
+        Err(e) => {
+            log::warn!("Failed to bind IPv6 socket: {}", e);
+        }
+    }
+    // Interestingly, on my macOS, sometimes my ipv6 works, sometimes not (test with ping6 or https://test-ipv6.com/).
+    // I checked ifconfig, could not see any difference. Both secure ipv6 and temporary ipv6 are there.
+    // So we can not rely on the local ipv6 address queries with if_addrs.
+    // above test_bind_ipv6 is safer, because it can fail in this case.
+    /*
+    std::thread::spawn(|| {
+        if let Ok(ifaces) = if_addrs::get_if_addrs() {
+            for iface in ifaces {
+                if let if_addrs::IfAddr::V6(v6) = iface.addr {
+                    let ip = v6.ip;
+                    if !ip.is_loopback()
+                        && !ip.is_unspecified()
+                        && !ip.is_multicast()
+                        && !ip.is_unique_local()
+                        && !ip.is_unicast_link_local()
+                        && (ip.segments()[0] & 0xe000) == 0x2000
+                    {
+                        // only use the first one, on mac, the first one is the stable
+                        // one, the last one is the temporary one. The middle ones are deperecated.
+                        *PUBLIC_IPV6_ADDR.lock().unwrap() =
+                            Some((SocketAddr::from((ip, 0)), Instant::now()));
+                        log::debug!("Found public IPv6 address locally: {}", ip);
+                        break;
+                    }
+                }
+            }
+        }
+    });
+    */
+
+    Some(tokio::spawn(async {
+        use hbb_common::futures::future::{select_ok, FutureExt};
+        let tests = STUNS_V6
+            .iter()
+            .map(|&stun| stun_ipv6_test(stun).boxed())
+            .collect::<Vec<_>>();
+
+        match select_ok(tests).await {
+            Ok(res) => {
+                let mut addr = res.0 .0;
+                addr.set_port(0); // Set port to 0 to avoid conflicts
+                PUBLIC_IPV6_ADDR.lock().unwrap().0 = Some(addr);
+                log::debug!(
+                    "Found public IPv6 address via STUN server {}: {}",
+                    res.0 .1,
+                    addr
+                );
+            }
+            Err(e) => {
+                log::error!("Failed to get public IPv6 address: {}", e);
+            }
+        };
+    }))
+}
+
+pub async fn punch_udp(
+    socket: Arc<UdpSocket>,
+    listen: bool,
+) -> ResultType<Option<bytes::BytesMut>> {
+    let mut retry_interval = Duration::from_millis(20);
+    const MAX_INTERVAL: Duration = Duration::from_millis(200);
+    const MAX_TIME: Duration = Duration::from_secs(20);
+    let mut packets_sent = 0;
+    socket.send(&[]).await.ok();
+    packets_sent += 1;
+    let mut last_send_time = Instant::now();
+    let tm = Instant::now();
+    let mut data = [0u8; 1500];
+
+    loop {
+        tokio::select! {
+            _ = hbb_common::sleep(retry_interval.as_secs_f32()) => {
+                if tm.elapsed() > MAX_TIME {
+                    bail!("UDP punch is timed out, stop sending packets after {:?} packets", packets_sent);
+                }
+                let elapsed = last_send_time.elapsed();
+
+                if elapsed >= retry_interval {
+                    socket.send(&[]).await.ok();
+                    packets_sent += 1;
+
+                    // Exponentially increase interval to reduce network pressure
+                    retry_interval = std::cmp::min(
+                        Duration::from_millis((retry_interval.as_millis() as f64 * 1.5) as u64),
+                        MAX_INTERVAL
+                    );
+                    last_send_time = Instant::now();
+                }
+            }
+            res = socket.recv(&mut data) => match res {
+                Err(e) => bail!("UDP punch failed, {packets_sent} packets sent: {e}"),
+                Ok(n) => {
+                    // log::debug!("UDP punch succeeded after sending {} packets after {:?}", packets_sent, tm.elapsed());
+                    if listen {
+                        if n == 0 {
+                            continue;
+                        }
+                        return Ok(Some(bytes::BytesMut::from(&data[..n])));
+                    }
+                    return Ok(None);
+                }
+            }
+        }
+    }
+}
+
+fn test_ipv6_sync() {
+    #[tokio::main(flavor = "current_thread")]
+    async fn func() {
+        if let Some(job) = test_ipv6().await {
+            job.await.ok();
+        }
+    }
+    std::thread::spawn(func);
+}
+
+pub async fn get_ipv6_socket() -> Option<(Arc<UdpSocket>, bytes::Bytes)> {
+    let Some(addr) = PUBLIC_IPV6_ADDR.lock().unwrap().0 else {
+        return None;
+    };
+
+    match UdpSocket::bind(addr).await {
+        Err(err) => {
+            log::warn!("Failed to create UDP socket for IPv6: {err}");
+        }
+        Ok(socket) => {
+            if let Ok(local_addr_v6) = socket.local_addr() {
+                return Some((
+                    Arc::new(socket),
+                    hbb_common::AddrMangle::encode(local_addr_v6).into(),
+                ));
+            }
+        }
+    }
+    None
 }
 
 #[cfg(test)]
@@ -1734,30 +2169,5 @@ mod tests {
             Duration::from_secs_f64(dur.as_secs_f64() * 0.499 * 1e-9),
             Duration::from_nanos(0)
         );
-    }
-
-    #[tokio::test]
-    #[cfg(not(any(
-        target_os = "android",
-        target_os = "ios",
-        all(target_os = "linux", feature = "unix-file-copy-paste")
-    )))]
-    async fn test_clipboard_context() {
-        #[cfg(target_os = "linux")]
-        let dur = {
-            let dur = Duration::from_micros(500);
-            arboard::Clipboard::set_x11_server_conn_timeout(dur);
-            dur
-        };
-
-        let _ctx = ClipboardContext::new();
-        #[cfg(target_os = "linux")]
-        {
-            assert_eq!(
-                arboard::Clipboard::get_x11_server_conn_timeout(),
-                dur,
-                "Failed to restore x11 server conn timeout"
-            );
-        }
     }
 }

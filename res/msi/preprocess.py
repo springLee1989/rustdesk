@@ -6,8 +6,12 @@ import sys
 import uuid
 import argparse
 import datetime
+import subprocess
 import re
+import platform
 from pathlib import Path
+from itertools import chain
+import shutil
 
 g_indent_unit = "\t"
 g_version = ""
@@ -31,10 +35,12 @@ g_arpsystemcomponent = {
     },
     "ReadMe": {
         "msi": "ARPREADME",
-        "v": "https://github.com/fufesou/rustdesk",
+        "v": "https://github.com/rustdesk/rustdesk",
     },
 }
 
+def default_revision_version():
+    return int(datetime.datetime.now().timestamp() / 60)
 
 def make_parser():
     parser = argparse.ArgumentParser(description="Msi preprocess script.")
@@ -43,17 +49,15 @@ def make_parser():
         "--dist-dir",
         type=str,
         default="../../rustdesk",
-        help="The dist direcotry to install.",
+        help="The dist directory to install.",
     )
     parser.add_argument(
-        "-arp",
         "--arp",
         action="store_true",
         help="Is ARPSYSTEMCOMPONENT",
         default=False,
     )
     parser.add_argument(
-        "-custom-arp",
         "--custom-arp",
         type=str,
         default="{}",
@@ -63,10 +67,19 @@ def make_parser():
         "-c", "--custom", action="store_true", help="Is custom client", default=False
     )
     parser.add_argument(
-        "-an", "--app-name", type=str, default="RustDesk", help="The app name."
+        "--conn-type",
+        type=str,
+        default="",
+        help='Connection type, e.g. "incoming", "outgoing". Default is empty, means incoming-outgoing',
+    )
+    parser.add_argument(
+        "--app-name", type=str, default="RustDesk", help="The app name."
     )
     parser.add_argument(
         "-v", "--version", type=str, default="", help="The app version."
+    )
+    parser.add_argument(
+        "--revision-version", type=int, default=default_revision_version(), help="The revision version."
     )
     parser.add_argument(
         "-m",
@@ -79,7 +92,7 @@ def make_parser():
 
 
 def read_lines_and_start_index(file_path, tag_start, tag_end):
-    with open(file_path, "r") as f:
+    with open(file_path, "r", encoding="utf-8") as f:
         lines = f.readlines()
     index_start = -1
     index_end = -1
@@ -149,7 +162,7 @@ def gen_pre_vars(args, dist_dir):
             f'{indent}<?define Description="{args.app_name} Installer" ?>\n',
             f'{indent}<?define ProductLower="{args.app_name.lower()}" ?>\n',
             f'{indent}<?define RegKeyRoot=".$(var.ProductLower)" ?>\n',
-            f'{indent}<?define RegKeyInstall="$(var.RegKeyRoot)\Install" ?>\n',
+            f'{indent}<?define RegKeyInstall="$(var.RegKeyRoot)\\Install" ?>\n',
             f'{indent}<?define BuildDir="{dist_dir}" ?>\n',
             f'{indent}<?define BuildDate="{g_build_date}" ?>\n',
             "\n",
@@ -169,19 +182,31 @@ def gen_pre_vars(args, dist_dir):
 def replace_app_name_in_langs(app_name):
     langs_dir = Path(sys.argv[0]).parent.joinpath("Package/Language")
     for file_path in langs_dir.glob("*.wxl"):
-        with open(file_path, "r") as f:
+        with open(file_path, "r", encoding="utf-8") as f:
             lines = f.readlines()
         for i, line in enumerate(lines):
             lines[i] = line.replace("RustDesk", app_name)
-        with open(file_path, "w") as f:
+        with open(file_path, "w", encoding="utf-8") as f:
             f.writelines(lines)
 
+def replace_app_name_in_custom_actions(app_name):
+    custion_actions_dir = Path(sys.argv[0]).parent.joinpath("CustomActions")
+    for file_path in chain(custion_actions_dir.glob("*.cpp"), custion_actions_dir.glob("*.h")):
+        with open(file_path, "r", encoding="utf-8") as f:
+            lines = f.readlines()
+        for i, line in enumerate(lines):
+            line = re.sub(r"\bRustDesk\b", app_name, line)
+            line = line.replace(f"{app_name} v4 Printer Driver", "RustDesk v4 Printer Driver")
+            lines[i] = line
+        with open(file_path, "w", encoding="utf-8") as f:
+            f.writelines(lines)
 
 def gen_upgrade_info():
     def func(lines, index_start):
         indent = g_indent_unit * 3
 
-        major, _, _ = g_version.split(".")
+        vs = g_version.split(".")
+        major = vs[0]
         upgrade_id = uuid.uuid4()
         to_insert_lines = [
             f'{indent}<Upgrade Id="{upgrade_id}">\n',
@@ -289,7 +314,7 @@ def gen_custom_ARPSYSTEMCOMPONENT_True(args, dist_dir):
             f'{indent}<RegistryValue Type="string" Name="DisplayName" Value="{args.app_name}" />\n'
         )
         lines_new.append(
-            f'{indent}<RegistryValue Type="string" Name="DisplayIcon" Value="[INSTALLFOLDER]{args.app_name}.exe" />\n'
+            f'{indent}<RegistryValue Type="string" Name="DisplayIcon" Value="[INSTALLFOLDER_INNER]{args.app_name}.exe" />\n'
         )
         lines_new.append(
             f'{indent}<RegistryValue Type="string" Name="DisplayVersion" Value="{g_version}" />\n'
@@ -302,7 +327,7 @@ def gen_custom_ARPSYSTEMCOMPONENT_True(args, dist_dir):
             f'{indent}<RegistryValue Type="string" Name="InstallDate" Value="{installDate}" />\n'
         )
         lines_new.append(
-            f'{indent}<RegistryValue Type="string" Name="InstallLocation" Value="[INSTALLFOLDER]" />\n'
+            f'{indent}<RegistryValue Type="string" Name="InstallLocation" Value="[INSTALLFOLDER_INNER]" />\n'
         )
         lines_new.append(
             f'{indent}<RegistryValue Type="string" Name="InstallSource" Value="[InstallSource]" />\n'
@@ -325,8 +350,12 @@ def gen_custom_ARPSYSTEMCOMPONENT_True(args, dist_dir):
         lines_new.append(
             f'{indent}<RegistryValue Type="expandable" Name="UninstallString" Value="MsiExec.exe /X [ProductCode]" />\n'
         )
+        lines_new.append(
+            f'{indent}<RegistryValue Type="expandable" Name="QuietUninstallString" Value="MsiExec.exe /qn /X [ProductCode]" />\n'
+        )
 
-        major, minor, build = g_version.split(".")
+        vs = g_version.split(".")
+        major, minor, build = vs[0], vs[1], vs[2]
         lines_new.append(
             f'{indent}<RegistryValue Type="string" Name="Version" Value="{g_version}" />\n'
         )
@@ -375,6 +404,26 @@ def gen_custom_ARPSYSTEMCOMPONENT(args, dist_dir):
     else:
         return gen_custom_ARPSYSTEMCOMPONENT_False(args)
 
+def gen_conn_type(args):
+    def func(lines, index_start):
+        indent = g_indent_unit * 3
+
+        lines_new = []
+        if args.conn_type != "":
+            lines_new.append(
+                f"""{indent}<Property Id="CC_CONNECTION_TYPE" Value="{args.conn_type}" />\n"""
+            )
+
+        for i, line in enumerate(lines_new):
+            lines.insert(index_start + i + 1, line)
+        return lines
+
+    return gen_content_between_tags(
+        "Package/Fragments/AddRemoveProperties.wxs",
+        "<!--$CustomClientPropsStart$-->",
+        "<!--$CustomClientPropsEnd$-->",
+        func,
+    )
 
 def gen_content_between_tags(filename, tag_start, tag_end, func):
     target_file = Path(sys.argv[0]).parent.joinpath(filename)
@@ -384,51 +433,79 @@ def gen_content_between_tags(filename, tag_start, tag_end, func):
 
     func(lines, index_start)
 
-    with open(target_file, "w") as f:
+    with open(target_file, "w", encoding="utf-8") as f:
         f.writelines(lines)
 
     return True
 
 
-def init_global_vars(args):
-    var_file = "../../src/version.rs"
-    if not Path(var_file).exists():
-        print(f"Error: {var_file} not found")
+def prepare_resources():
+    icon_src = Path(sys.argv[0]).parent.joinpath("../icon.ico")
+    icon_dst = Path(sys.argv[0]).parent.joinpath("Package/Resources/icon.ico")
+    if icon_src.exists():
+        icon_dst.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy(icon_src, icon_dst)
+        return True
+    else:
+        # unreachable
+        print(f"Error: icon.ico not found in {icon_src}")
         return False
 
-    with open(var_file, "r") as f:
-        content = f.readlines()
+
+def init_global_vars(dist_dir, app_name, args):
+    dist_app = dist_dir.joinpath(app_name + ".exe")
+
+    def read_process_output(args):
+        process = subprocess.Popen(
+            f"{dist_app} {args}",
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            shell=True,
+        )
+        output, _ = process.communicate()
+        return output.decode("utf-8").strip()
 
     global g_version
     global g_build_date
     g_version = args.version.replace("-", ".")
     if g_version == "":
-        # pub const VERSION: &str = "1.2.4";
-        version_pattern = re.compile(r'.*VERSION: &str = "(.*)";.*')
-        for line in content:
-            match = version_pattern.match(line)
-            if match:
-                g_version = match.group(1)
-                break
-    if g_version == "":
-        print(f"Error: version not found in {var_file}")
+        g_version = read_process_output("--version")
+    version_pattern = re.compile(r"\d+\.\d+\.\d+.*")
+    if not version_pattern.match(g_version):
+        print(f"Error: version {g_version} not found in {dist_app}")
+        return False
+    if g_version.count(".") == 2:
+        # https://github.com/dotnet/runtime/blob/5535e31a712343a63f5d7d796cd874e563e5ac14/src/libraries/System.Private.CoreLib/src/System/Version.cs
+        if args.revision_version < 0 or args.revision_version > 2147483647:
+            raise ValueError(f"Invalid revision version: {args.revision_version}")    
+        g_version = f"{g_version}.{args.revision_version}"
+
+    g_build_date = read_process_output("--build-date")
+    build_date_pattern = re.compile(r"\d{4}-\d{2}-\d{2} \d{2}:\d{2}")
+    if not build_date_pattern.match(g_build_date):
+        print(f"Error: build date {g_build_date} not found in {dist_app}")
         return False
 
-    # pub const BUILD_DATE: &str = "2024-04-08 23:11";
-    build_date_pattern = re.compile(r'BUILD_DATE: &str = "(.*)";')
-    for line in content:
-        match = build_date_pattern.match(line)
-        if match:
-            g_build_date = match.group(1)
-            break
-
     return True
+
+
+def update_license_file(app_name):
+    if app_name == "RustDesk":
+        return
+    license_file = Path(sys.argv[0]).parent.joinpath("Package/License.rtf")
+    with open(license_file, "r", encoding="utf-8") as f:
+        license_content = f.read()
+    license_content = license_content.replace("website rustdesk.com and other ", "")
+    license_content = license_content.replace("RustDesk", app_name)
+    license_content = re.sub("Purslane Ltd", app_name, license_content, flags=re.IGNORECASE)
+    with open(license_file, "w", encoding="utf-8") as f:
+        f.write(license_content)
 
 
 def replace_component_guids_in_wxs():
     langs_dir = Path(sys.argv[0]).parent.joinpath("Package")
     for file_path in langs_dir.glob("**/*.wxs"):
-        with open(file_path, "r") as f:
+        with open(file_path, "r", encoding="utf-8") as f:
             lines = f.readlines()
 
         # <Component Id="Product.Registry.DefaultIcon" Guid="6DBF2690-0955-4C6A-940F-634DDA503F49">
@@ -437,7 +514,7 @@ def replace_component_guids_in_wxs():
             if match:
                 lines[i] = re.sub(r'Guid="[^"]+"', f'Guid="{uuid.uuid4()}"', line)
 
-        with open(file_path, "w") as f:
+        with open(file_path, "w", encoding="utf-8") as f:
             f.writelines(lines)
 
 
@@ -448,8 +525,13 @@ if __name__ == "__main__":
     app_name = args.app_name
     dist_dir = Path(sys.argv[0]).parent.joinpath(args.dist_dir).resolve()
 
-    if not init_global_vars(args):
+    if not prepare_resources():
         sys.exit(-1)
+
+    if not init_global_vars(dist_dir, app_name, args):
+        sys.exit(-1)
+
+    update_license_file(app_name)
 
     if not gen_pre_vars(args, dist_dir):
         sys.exit(-1)
@@ -463,6 +545,9 @@ if __name__ == "__main__":
     if not gen_custom_ARPSYSTEMCOMPONENT(args, dist_dir):
         sys.exit(-1)
 
+    if not gen_conn_type(args):
+        sys.exit(-1)
+
     if not gen_auto_component(app_name, dist_dir):
         sys.exit(-1)
 
@@ -470,3 +555,4 @@ if __name__ == "__main__":
         sys.exit(-1)
 
     replace_app_name_in_langs(args.app_name)
+    replace_app_name_in_custom_actions(args.app_name)

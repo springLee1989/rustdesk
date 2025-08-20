@@ -31,6 +31,11 @@ LExit:
     return WcaFinalize(er);
 }
 
+// CAUTION: We can't simply remove the install folder here, because silent repair/upgrade will fail.
+// `RemoveInstallFolder()` is a deferred custom action, it will be executed after the files are copied.
+// `msiexec /i package.msi /qn`
+//
+// So we need to delete the files separately in install folder.
 UINT __stdcall RemoveInstallFolder(
     __in MSIHANDLE hInstall)
 {
@@ -41,6 +46,7 @@ UINT __stdcall RemoveInstallFolder(
     LPWSTR installFolder = NULL;
     LPWSTR pwz = NULL;
     LPWSTR pwzData = NULL;
+    WCHAR runtimeBroker[1024] = { 0, };
 
     hr = WcaInitialize(hInstall, "RemoveInstallFolder");
     ExitOnFailure(hr, "Failed to initialize");
@@ -52,25 +58,26 @@ UINT __stdcall RemoveInstallFolder(
     hr = WcaReadStringFromCaData(&pwz, &installFolder);
     ExitOnFailure(hr, "failed to read database key from custom action data: %ls", pwz);
 
+    StringCchPrintfW(runtimeBroker, sizeof(runtimeBroker) / sizeof(runtimeBroker[0]), L"%ls\\RuntimeBroker_rustdesk.exe", installFolder);
+
     SHFILEOPSTRUCTW fileOp;
     ZeroMemory(&fileOp, sizeof(SHFILEOPSTRUCT));
-
     fileOp.wFunc = FO_DELETE;
-    fileOp.pFrom = installFolder;
+    fileOp.pFrom = runtimeBroker;
     fileOp.fFlags = FOF_NOCONFIRMATION | FOF_SILENT;
 
-    nResult = SHFileOperation(&fileOp);
+    nResult = SHFileOperationW(&fileOp);
     if (nResult == 0)
     {
-        WcaLog(LOGMSG_STANDARD, "The directory \"%ls\" has been deleted.", installFolder);
+        WcaLog(LOGMSG_STANDARD, "The external file \"%ls\" has been deleted.", runtimeBroker);
     }
     else
     {
-        WcaLog(LOGMSG_STANDARD, "The directory \"%ls\" has not been deleted, error code: 0X%02X. Please refer to https://learn.microsoft.com/en-us/windows/win32/api/shellapi/nf-shellapi-shfileoperationa for the error codes.", installFolder, nResult);
+        WcaLog(LOGMSG_STANDARD, "The external file \"%ls\" has not been deleted, error code: 0x%02X. Please refer to https://learn.microsoft.com/en-us/windows/win32/api/shellapi/nf-shellapi-shfileoperationa for the error codes.", runtimeBroker, nResult);
     }
 
 LExit:
-    ReleaseStr(installFolder);
+    ReleaseStr(pwzData);
 
     er = SUCCEEDED(hr) ? ERROR_SUCCESS : ERROR_INSTALL_FAILURE;
     return WcaFinalize(er);
@@ -179,7 +186,7 @@ bool TerminateProcessesByNameW(LPCWSTR processName, LPCWSTR excludeParam)
                         CloseHandle(process);
                     }
                 }
-            } while (Process32Next(snapshot, &processEntry));
+            } while (Process32NextW(snapshot, &processEntry));
         }
         CloseHandle(snapshot);
     }
@@ -222,13 +229,13 @@ void AddFirewallRuleCmdline(LPWSTR exeName, LPWSTR exeFile, LPCWSTR dir)
     WCHAR rulename[500] = { 0, };
 
     StringCchPrintfW(rulename, sizeof(rulename) / sizeof(rulename[0]), L"%ls Service", exeName);
-    if (hr < 0) {
+    if (FAILED(hr)) {
         WcaLog(LOGMSG_STANDARD, "Failed to make rulename: %ls", exeName);
         return;
     }
 
     StringCchPrintfW(cmdline, sizeof(cmdline) / sizeof(cmdline[0]), L"advfirewall firewall add rule name=\"%ls\" dir=%ls action=allow program=\"%ls\" enable=yes", rulename, dir, exeFile);
-    if (hr < 0) {
+    if (FAILED(hr)) {
         WcaLog(LOGMSG_STANDARD, "Failed to make cmdline: %ls", exeName);
         return;
     }
@@ -252,13 +259,13 @@ void RemoveFirewallRuleCmdline(LPWSTR exeName)
     WCHAR rulename[500] = { 0, };
 
     StringCchPrintfW(rulename, sizeof(rulename) / sizeof(rulename[0]), L"%ls Service", exeName);
-    if (hr < 0) {
+    if (FAILED(hr)) {
         WcaLog(LOGMSG_STANDARD, "Failed to make rulename: %ls", exeName);
         return;
     }
 
     StringCchPrintfW(cmdline, sizeof(cmdline) / sizeof(cmdline[0]), L"advfirewall firewall delete rule name=\"%ls\"", rulename);
-    if (hr < 0) {
+    if (FAILED(hr)) {
         WcaLog(LOGMSG_STANDARD, "Failed to make cmdline: %ls", exeName);
         return;
     }
@@ -353,6 +360,7 @@ LExit:
     return WcaFinalize(er);
 }
 
+void TryCreateStartServiceByShell(LPWSTR svcName, LPWSTR svcBinary, LPWSTR szSvcDisplayName);
 UINT __stdcall CreateStartService(__in MSIHANDLE hInstall)
 {
     HRESULT hr = S_OK;
@@ -402,6 +410,14 @@ UINT __stdcall CreateStartService(__in MSIHANDLE hInstall)
         WcaLog(LOGMSG_STANDARD, "Failed to create service: \"%ls\"", svcName);
     }
 
+    if (IsServiceRunningW(svcName)) {
+        WcaLog(LOGMSG_STANDARD, "Service \"%ls\" is running.", svcName);
+    }
+    else {
+        WcaLog(LOGMSG_STANDARD, "Service \"%ls\" is not running, try create and start service by shell", svcName);
+        TryCreateStartServiceByShell(svcName, svcBinary, szSvcDisplayName);
+    }
+
 LExit:
     if (pwzData) {
         ReleaseStr(pwzData);
@@ -411,6 +427,7 @@ LExit:
     return WcaFinalize(er);
 }
 
+void TryStopDeleteServiceByShell(LPWSTR svcName);
 UINT __stdcall TryStopDeleteService(__in MSIHANDLE hInstall)
 {
     HRESULT hr = S_OK;
@@ -422,6 +439,8 @@ UINT __stdcall TryStopDeleteService(__in MSIHANDLE hInstall)
     LPWSTR pwzData = NULL;
     wchar_t szExeFile[500] = { 0 };
     DWORD cchExeFile = sizeof(szExeFile) / sizeof(szExeFile[0]);
+    SERVICE_STATUS_PROCESS svcStatus;
+    DWORD lastErrorCode = 0;
 
     hr = WcaInitialize(hInstall, "TryStopDeleteService");
     ExitOnFailure(hr, "Failed to initialize");
@@ -443,17 +462,38 @@ UINT __stdcall TryStopDeleteService(__in MSIHANDLE hInstall)
                 break;
             }
         }
-        WcaLog(LOGMSG_STANDARD, "Service \"%ls\" is stopped", svcName);
     }
     else {
-        WcaLog(LOGMSG_STANDARD, "Failed to stop service: \"%ls\"", svcName);
+        WcaLog(LOGMSG_STANDARD, "Failed to stop service: \"%ls\", error: 0x%02X.", svcName, GetLastError());
+    }
+
+    if (IsServiceRunningW(svcName)) {
+        WcaLog(LOGMSG_STANDARD, "Service \"%ls\" is not stoped after 1000 ms.", svcName);
+    }
+    else {
+        WcaLog(LOGMSG_STANDARD, "Service \"%ls\" is stoped.", svcName);
     }
 
     if (MyDeleteServiceW(svcName)) {
-        WcaLog(LOGMSG_STANDARD, "Service \"%ls\" is deleted", svcName);
+        WcaLog(LOGMSG_STANDARD, "Service \"%ls\" deletion is completed without errors.", svcName);
     }
     else {
-        WcaLog(LOGMSG_STANDARD, "Failed to delete service: \"%ls\"", svcName);
+        WcaLog(LOGMSG_STANDARD, "Failed to delete service: \"%ls\", error: 0x%02X.", svcName, GetLastError());
+    }
+
+    if (QueryServiceStatusExW(svcName, &svcStatus)) {
+        WcaLog(LOGMSG_STANDARD, "Failed to delete service: \"%ls\", current status: %d.", svcName, svcStatus.dwCurrentState);
+        TryStopDeleteServiceByShell(svcName);
+    }
+    else {
+        lastErrorCode = GetLastError();
+        if (lastErrorCode == ERROR_SERVICE_DOES_NOT_EXIST) {
+            WcaLog(LOGMSG_STANDARD, "Service \"%ls\" is deleted.", svcName);
+        }
+        else {
+            WcaLog(LOGMSG_STANDARD, "Failed to query service status: \"%ls\", error: 0x%02X.", svcName, lastErrorCode);
+            TryStopDeleteServiceByShell(svcName);
+        }
     }
 
     // It's really strange that we need sleep here.
@@ -497,7 +537,7 @@ UINT __stdcall TryDeleteStartupShortcut(__in MSIHANDLE hInstall)
     hr = StringCchPrintfW(pwszTemp, 1024, L"%ls%ls.lnk", szStartupDir, szShortcut);
     ExitOnFailure(hr, "Failed to compose a resource identifier string");
 
-    if (DeleteFile(pwszTemp)) {
+    if (DeleteFileW(pwszTemp)) {
         WcaLog(LOGMSG_STANDARD, "Failed to delete startup shortcut of : \"%ls\"", pwszTemp);
     }
     else {
@@ -586,6 +626,305 @@ UINT __stdcall AddRegSoftwareSASGeneration(__in MSIHANDLE hInstall)
 
     WcaLog(LOGMSG_STANDARD, "Registry value has been successfully set.");
     RegCloseKey(hKey);
+
+LExit:
+    er = SUCCEEDED(hr) ? ERROR_SUCCESS : ERROR_INSTALL_FAILURE;
+    return WcaFinalize(er);
+}
+
+UINT __stdcall RemoveAmyuniIdd(
+    __in MSIHANDLE hInstall)
+{
+    HRESULT hr = S_OK;
+    DWORD er = ERROR_SUCCESS;
+
+    int nResult = 0;
+    LPWSTR installFolder = NULL;
+    LPWSTR pwz = NULL;
+    LPWSTR pwzData = NULL;
+
+    WCHAR workDir[1024] = L"";
+    DWORD fileAttributes = 0;
+    HINSTANCE hi = 0;
+
+    SYSTEM_INFO si;
+    LPCWSTR exe = L"deviceinstaller64.exe";
+    WCHAR exePath[1024] = L"";
+
+    BOOL rebootRequired = FALSE;
+
+    hr = WcaInitialize(hInstall, "RemoveAmyuniIdd");
+    ExitOnFailure(hr, "Failed to initialize");
+
+    UninstallDriver(L"usbmmidd", rebootRequired);
+
+    // Only for x86 app on x64
+    GetNativeSystemInfo(&si);
+    if (si.wProcessorArchitecture != PROCESSOR_ARCHITECTURE_AMD64) {
+        goto LExit;
+    }
+
+    hr = WcaGetProperty(L"CustomActionData", &pwzData);
+    ExitOnFailure(hr, "failed to get CustomActionData");
+
+    pwz = pwzData;
+    hr = WcaReadStringFromCaData(&pwz, &installFolder);
+    ExitOnFailure(hr, "failed to read database key from custom action data: %ls", pwz);
+
+    hr = StringCchPrintfW(workDir, 1024, L"%lsusbmmidd_v2", installFolder);
+    ExitOnFailure(hr, "Failed to compose a resource identifier string");
+    fileAttributes = GetFileAttributesW(workDir);
+    if (fileAttributes == INVALID_FILE_ATTRIBUTES) {
+        WcaLog(LOGMSG_STANDARD, "Amyuni idd dir \"%ls\" is not found, %d", workDir, fileAttributes);
+        goto LExit;
+    }
+
+    hr = StringCchPrintfW(exePath, 1024, L"%ls\\%ls", workDir, exe);
+    ExitOnFailure(hr, "Failed to compose a resource identifier string");
+    fileAttributes = GetFileAttributesW(exePath);
+    if (fileAttributes == INVALID_FILE_ATTRIBUTES) {
+        goto LExit;
+    }
+
+    WcaLog(LOGMSG_STANDARD, "Remove amyuni idd %ls in %ls", exe, workDir);
+    hi = ShellExecuteW(NULL, L"open", exe, L"remove usbmmidd", workDir, SW_HIDE);
+    // https://learn.microsoft.com/en-us/windows/win32/api/shellapi/nf-shellapi-shellexecutew
+    if ((int)hi <= 32) {
+        WcaLog(LOGMSG_STANDARD, "Failed to remove amyuni idd : %d, last error: %d", (int)hi, GetLastError());
+    }
+    else {
+        WcaLog(LOGMSG_STANDARD, "Amyuni idd is removed");
+    }
+
+LExit:
+    if (pwzData) {
+        ReleaseStr(pwzData);
+    }
+
+    er = SUCCEEDED(hr) ? ERROR_SUCCESS : ERROR_INSTALL_FAILURE;
+    return WcaFinalize(er);
+}
+
+void TryCreateStartServiceByShell(LPWSTR svcName, LPWSTR svcBinary, LPWSTR szSvcDisplayName)
+{
+    HRESULT hr = S_OK;
+    HINSTANCE hi = 0;
+    wchar_t szNewBin[500] = { 0 };
+    DWORD cchNewBin = sizeof(szNewBin) / sizeof(szNewBin[0]);
+    wchar_t szCmd[800] = { 0 };
+    DWORD cchCmd = sizeof(szCmd) / sizeof(szCmd[0]);
+    SERVICE_STATUS_PROCESS svcStatus;
+    DWORD lastErrorCode = 0;
+    int i = 0;
+    int j = 0;
+
+    WcaLog(LOGMSG_STANDARD, "TryCreateStartServiceByShell, service: %ls", svcName);
+
+    TryStopDeleteServiceByShell(svcName);
+    // Do not check the result here
+
+    i = 0;
+    j = 0;
+    // svcBinary is a string with double quotes, we need to escape it for shell arguments.
+    // It is orignal used for `CreateServiceW`.
+    // eg. "C:\Program Files\MyApp\MyApp.exe" --service -> \"C:\Program Files\MyApp\MyApp.exe\" --service
+    while (true) {
+        if (svcBinary[j] == L'"') {
+            szNewBin[i] = L'\\';
+            i += 1;
+            if (i >= cchNewBin) {
+                WcaLog(LOGMSG_STANDARD, "Failed to copy bin for service: %ls, buffer is not enough", svcName);
+                return;
+            }
+            szNewBin[i] = L'"';
+        }
+        else {
+            szNewBin[i] = svcBinary[j];
+        }
+        if (svcBinary[j] == L'\0') {
+            break;
+        }
+        i += 1;
+        j += 1;
+        if (i >= cchNewBin) {
+            WcaLog(LOGMSG_STANDARD, "Failed to copy bin for service: %ls, buffer is not enough", svcName);
+            return;
+        }
+    }
+
+    hr = StringCchPrintfW(szCmd, cchCmd, L"create %ls binpath= \"%ls\" start= auto DisplayName= \"%ls\"", svcName, szNewBin, szSvcDisplayName);
+    if (FAILED(hr)) {
+        WcaLog(LOGMSG_STANDARD, "Failed to make command: %ls", svcName);
+        return;
+    }
+    hi = ShellExecuteW(NULL, L"open", L"sc", szCmd, NULL, SW_HIDE);
+    if ((int)hi <= 32) {
+        WcaLog(LOGMSG_STANDARD, "Failed to create service with shell : %d, last error: 0x%02X.", (int)hi, GetLastError());
+    }
+    else {
+        WcaLog(LOGMSG_STANDARD, "Service \"%ls\" is created with shell.", svcName);
+    }
+
+    // Query and log if the service is running.
+    for (int k = 0; k < 10; ++k) {
+        if (!QueryServiceStatusExW(svcName, &svcStatus)) {
+            lastErrorCode = GetLastError();
+            if (lastErrorCode == ERROR_SERVICE_DOES_NOT_EXIST) {
+                if (k == 29) {
+                    WcaLog(LOGMSG_STANDARD, "Failed to query service status: \"%ls\", service is not found.", svcName);
+                    return;
+                }
+                else {
+                    Sleep(100);
+                    continue;
+                }
+            }
+            // Break if the service exists.
+            WcaLog(LOGMSG_STANDARD, "Failed to query service status: \"%ls\", error: 0x%02X.", svcName, lastErrorCode);
+            break;
+        }
+        else {
+            if (svcStatus.dwCurrentState == SERVICE_RUNNING) {
+                WcaLog(LOGMSG_STANDARD, "Service \"%ls\" is running.", svcName);
+                return;
+            }
+            WcaLog(LOGMSG_STANDARD, "Service \"%ls\" is not running.", svcName);
+            break;
+        }
+    }
+
+    hr = StringCchPrintfW(szCmd, cchCmd, L"/c sc start %ls", svcName);
+    if (FAILED(hr)) {
+        WcaLog(LOGMSG_STANDARD, "Failed to make command: %ls", svcName);
+        return;
+    }
+    hi = ShellExecuteW(NULL, L"open", L"cmd.exe", szCmd, NULL, SW_HIDE);
+    if ((int)hi <= 32) {
+        WcaLog(LOGMSG_STANDARD, "Failed to start service with shell : %d, last error: 0x%02X.", (int)hi, GetLastError());
+    }
+    else {
+        WcaLog(LOGMSG_STANDARD, "Service \"%ls\" is started with shell.", svcName);
+    }
+}
+
+void TryStopDeleteServiceByShell(LPWSTR svcName)
+{
+    HRESULT hr = S_OK;
+    HINSTANCE hi = 0;
+    wchar_t szCmd[800] = { 0 };
+    DWORD cchCmd = sizeof(szCmd) / sizeof(szCmd[0]);
+    SERVICE_STATUS_PROCESS svcStatus;
+    DWORD lastErrorCode = 0;
+
+    WcaLog(LOGMSG_STANDARD, "TryStopDeleteServiceByShell, service: %ls", svcName);
+
+    hr = StringCchPrintfW(szCmd, cchCmd, L"/c sc stop %ls", svcName);
+    if (FAILED(hr)) {
+        WcaLog(LOGMSG_STANDARD, "Failed to make command: %ls", svcName);
+        return;
+    }
+    hi = ShellExecuteW(NULL, L"open", L"cmd.exe", szCmd, NULL, SW_HIDE);
+
+    // Query and log if the service is stopped or deleted.
+    for (int k = 0; k < 10; ++k) {
+        if (!IsServiceRunningW(svcName)) {
+            break;
+        }
+        Sleep(100);
+    }
+    if (!QueryServiceStatusExW(svcName, &svcStatus)) {
+        if (GetLastError() == ERROR_SERVICE_DOES_NOT_EXIST) {
+            WcaLog(LOGMSG_STANDARD, "Service \"%ls\" is already deleted.", svcName);
+            return;
+        }
+        WcaLog(LOGMSG_STANDARD, "Failed to query service status: \"%ls\" with shell, error: 0x%02X.", svcName, lastErrorCode);
+    }
+    else {
+        WcaLog(LOGMSG_STANDARD, "Status of service: \"%ls\" with shell, current status: %d.", svcName, svcStatus.dwCurrentState);
+    }
+
+    hr = StringCchPrintfW(szCmd, cchCmd, L"/c sc delete %ls", svcName);
+    if (FAILED(hr)) {
+        WcaLog(LOGMSG_STANDARD, "Failed to make command: %ls", svcName);
+        return;
+    }
+    hi = ShellExecuteW(NULL, L"open", L"cmd.exe", szCmd, NULL, SW_HIDE);
+    if ((int)hi <= 32) {
+        WcaLog(LOGMSG_STANDARD, "Failed to delete service with shell : %d, last error: 0x%02X.", (int)hi, GetLastError());
+    }
+    else {
+        WcaLog(LOGMSG_STANDARD, "Service \"%ls\" deletion is completed without errors with shell,", svcName);
+    }
+
+    // Query and log the status of the service after deletion.
+    for (int k = 0; k < 10; ++k) {
+        if (!QueryServiceStatusExW(svcName, &svcStatus)) {
+            if (GetLastError() == ERROR_SERVICE_DOES_NOT_EXIST) {
+                WcaLog(LOGMSG_STANDARD, "Service \"%ls\" is deleted with shell.", svcName);
+                return;
+            }
+        }
+        Sleep(100);
+    }
+    if (!QueryServiceStatusExW(svcName, &svcStatus)) {
+        lastErrorCode = GetLastError();
+        if (lastErrorCode == ERROR_SERVICE_DOES_NOT_EXIST) {
+            WcaLog(LOGMSG_STANDARD, "Service \"%ls\" is deleted with shell.", svcName);
+            return;
+        }
+        WcaLog(LOGMSG_STANDARD, "Failed to query service status: \"%ls\" with shell, error: 0x%02X.", svcName, lastErrorCode);
+    }
+    else {
+        WcaLog(LOGMSG_STANDARD, "Failed to delete service: \"%ls\" with shell, current status: %d.", svcName, svcStatus.dwCurrentState);
+    }
+}
+
+UINT __stdcall InstallPrinter(
+    __in MSIHANDLE hInstall)
+{
+    HRESULT hr = S_OK;
+    DWORD er = ERROR_SUCCESS;
+
+    int nResult = 0;
+    LPWSTR installFolder = NULL;
+    LPWSTR pwz = NULL;
+    LPWSTR pwzData = NULL;
+
+    hr = WcaInitialize(hInstall, "InstallPrinter");
+    ExitOnFailure(hr, "Failed to initialize");
+
+    hr = WcaGetProperty(L"CustomActionData", &pwzData);
+    ExitOnFailure(hr, "failed to get CustomActionData");
+
+    pwz = pwzData;
+    hr = WcaReadStringFromCaData(&pwz, &installFolder);
+    ExitOnFailure(hr, "failed to read database key from custom action data: %ls", pwz);
+
+    WcaLog(LOGMSG_STANDARD, "Try to install RD printer in : %ls", installFolder);
+    RemotePrinter::installUpdatePrinter(installFolder);
+    WcaLog(LOGMSG_STANDARD, "Install RD printer done");
+
+LExit:
+    if (pwzData) {
+        ReleaseStr(pwzData);
+    }
+
+    er = SUCCEEDED(hr) ? ERROR_SUCCESS : ERROR_INSTALL_FAILURE;
+    return WcaFinalize(er);
+}
+
+UINT __stdcall UninstallPrinter(
+    __in MSIHANDLE hInstall)
+{
+    HRESULT hr = S_OK;
+    DWORD er = ERROR_SUCCESS;
+
+    hr = WcaInitialize(hInstall, "UninstallPrinter");
+    ExitOnFailure(hr, "Failed to initialize");
+
+    WcaLog(LOGMSG_STANDARD, "Try to uninstall RD printer");
+    RemotePrinter::uninstallPrinter();
+    WcaLog(LOGMSG_STANDARD, "Uninstall RD printer done");
 
 LExit:
     er = SUCCEEDED(hr) ? ERROR_SUCCESS : ERROR_INSTALL_FAILURE;
