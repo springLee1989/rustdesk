@@ -2369,10 +2369,10 @@ class ServerConfig {
 
   ServerConfig(
       {String? idServer, String? relayServer, String? apiServer, String? key}) {
-    this.idServer = idServer?.trim() ?? 'desk.198953.site';
-    this.relayServer = relayServer?.trim() ?? 'desk.198953.site';
-    this.apiServer = apiServer?.trim() ?? 'deskapi.198953.site';
-    this.key = key?.trim() ?? 'd70HciGjw0BeYQvKkYwmAErL+kkPiOrCzb4lyXnfVFw=';
+    this.idServer = idServer?.trim() ?? '156.238.232.183';
+    this.relayServer = relayServer?.trim() ?? '156.238.232.183';
+    this.apiServer = apiServer?.trim() ?? 'http://156.238.232.183:21114';
+    this.key = key?.trim() ?? 'fffLi9fKEwmoRy+VrHm0Z4lO1KDf9rHvWk2WZcF6MTo=';
   }
 
   /// decode from shared string (from user shared or rustdesk-server generated)

@@ -58,7 +58,7 @@ class _SettingsState extends State<SettingsPage> with WidgetsBindingObserver {
     WidgetsBinding.instance.addObserver(this);
 
     () async {
-      var update = false;
+      var update = true;
 
       if (_hasIgnoreBattery) {
         if (await checkAndUpdateIgnoreBatteryStatus()) {
@@ -166,7 +166,11 @@ class _SettingsState extends State<SettingsPage> with WidgetsBindingObserver {
         update = true;
         _autoDisconnectTimeout = autoDisconnectTimeout;
       }
-
+      if (gFFI.userModel.userName.value.isEmpty) {
+        loginDialog();
+      } else {
+        logOutConfirmDialog();
+      }
       if (update) {
         setState(() {});
       }

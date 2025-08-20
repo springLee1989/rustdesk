@@ -205,7 +205,7 @@ class ServiceNotRunningNotification extends StatelessWidget {
                   if (gFFI.userModel.userName.value.isEmpty &&
                       bind.mainGetLocalOption(key: "show-scam-warning") !=
                           "N") {
-                    showScamWarning(context, serverModel);
+                    //showScamWarning(context, serverModel);
                   } else {
                     serverModel.toggleService();
                   }
@@ -795,10 +795,10 @@ void androidChannelInit() {
 }
 
 void showScamWarning(BuildContext context, ServerModel serverModel) {
-  showDialog(
-    context: context,
-    builder: (BuildContext context) {
-      return ScamWarningDialog(serverModel: serverModel);
-    },
-  );
+  // showDialog(
+  //   context: context,
+  //   builder: (BuildContext context) {
+  //     return ScamWarningDialog(serverModel: serverModel);
+  //   },
+  // );
 }
